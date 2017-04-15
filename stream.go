@@ -43,28 +43,25 @@ type stream struct {
 	frameQueue *streamFrameSorter
 	readChan   chan struct{}
 
-	dataForWriting       []byte
-	finSent              utils.AtomicBool
-	rstSent              utils.AtomicBool
-	doneWritingOrErrCond sync.Cond
+	dataForWriting []byte
+	finSent        utils.AtomicBool
+	rstSent        utils.AtomicBool
+	writeChan      chan struct{}
 
 	flowControlManager flowcontrol.FlowControlManager
 }
 
 // newStream creates a new Stream
 func newStream(StreamID protocol.StreamID, onData func(), onReset func(protocol.StreamID, protocol.ByteCount), flowControlManager flowcontrol.FlowControlManager) (*stream, error) {
-	s := &stream{
+	return &stream{
 		onData:             onData,
 		onReset:            onReset,
 		streamID:           StreamID,
 		flowControlManager: flowControlManager,
 		frameQueue:         newStreamFrameSorter(),
 		readChan:           make(chan struct{}, 1),
-	}
-
-	s.doneWritingOrErrCond.L = &s.mutex
-
-	return s, nil
+		writeChan:          make(chan struct{}, 1),
+	}, nil
 }
 
 // Read implements io.Reader. It is not thread safe!
@@ -151,7 +148,6 @@ func (s *stream) Write(p []byte) (int, error) {
 	}
 
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
 
 	if s.err != nil {
 		return 0, s.err
@@ -165,10 +161,20 @@ func (s *stream) Write(p []byte) (int, error) {
 	copy(s.dataForWriting, p)
 
 	s.onData()
+	s.mutex.Unlock()
 
-	for s.dataForWriting != nil && s.err == nil {
-		s.doneWritingOrErrCond.Wait()
+	for {
+		s.mutex.Lock()
+		if s.dataForWriting == nil || s.err != nil {
+			s.mutex.Unlock()
+			break
+		}
+		s.mutex.Unlock()
+		<-s.writeChan
 	}
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
 	if s.err != nil {
 		return 0, s.err
@@ -189,14 +195,12 @@ func (s *stream) lenOfDataForWriting() protocol.ByteCount {
 
 func (s *stream) getDataForWriting(maxBytes protocol.ByteCount) []byte {
 	s.mutex.Lock()
-	if s.err != nil {
-		s.mutex.Unlock()
+	defer s.mutex.Unlock()
+
+	if s.err != nil || s.dataForWriting == nil {
 		return nil
 	}
-	if s.dataForWriting == nil {
-		s.mutex.Unlock()
-		return nil
-	}
+
 	var ret []byte
 	if protocol.ByteCount(len(s.dataForWriting)) > maxBytes {
 		ret = s.dataForWriting[:maxBytes]
@@ -204,10 +208,9 @@ func (s *stream) getDataForWriting(maxBytes protocol.ByteCount) []byte {
 	} else {
 		ret = s.dataForWriting
 		s.dataForWriting = nil
-		s.doneWritingOrErrCond.Signal()
+		s.signalWrite()
 	}
 	s.writeOffset += protocol.ByteCount(len(ret))
-	s.mutex.Unlock()
 	return ret
 }
 
@@ -262,6 +265,14 @@ func (s *stream) signalRead() {
 	}
 }
 
+// signalRead performs a non-blocking send on the readChan
+func (s *stream) signalWrite() {
+	select {
+	case s.writeChan <- struct{}{}:
+	default:
+	}
+}
+
 // CloseRemote makes the stream receive a "virtual" FIN stream frame at a given offset
 func (s *stream) CloseRemote(offset protocol.ByteCount) {
 	s.AddStreamFrame(&frames.StreamFrame{FinBit: true, Offset: offset})
@@ -276,7 +287,7 @@ func (s *stream) Cancel(err error) {
 	if s.err == nil {
 		s.err = err
 		s.signalRead()
-		s.doneWritingOrErrCond.Signal()
+		s.signalWrite()
 	}
 	s.mutex.Unlock()
 }
@@ -292,7 +303,7 @@ func (s *stream) Reset(err error) {
 	if s.err == nil {
 		s.err = err
 		s.signalRead()
-		s.doneWritingOrErrCond.Signal()
+		s.signalWrite()
 	}
 	if s.shouldSendReset() {
 		s.onReset(s.streamID, s.writeOffset)
@@ -311,7 +322,7 @@ func (s *stream) RegisterRemoteError(err error) {
 	// errors must not be changed!
 	if s.err == nil {
 		s.err = err
-		s.doneWritingOrErrCond.Signal()
+		s.signalWrite()
 	}
 	if s.shouldSendReset() {
 		s.onReset(s.streamID, s.writeOffset)
