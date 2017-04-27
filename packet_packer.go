@@ -79,20 +79,6 @@ func (p *packetPacker) packPacket(stopWaitingFrame *frames.StopWaitingFrame, lea
 	// handshakePacketToRetransmit is only set for handshake retransmissions
 	isHandshakeRetransmission := (handshakePacketToRetransmit != nil)
 
-	var sealFunc handshake.Sealer
-	var encLevel protocol.EncryptionLevel
-
-	if isHandshakeRetransmission {
-		var err error
-		encLevel = handshakePacketToRetransmit.EncryptionLevel
-		sealFunc, err = p.cryptoSetup.GetSealerWithEncryptionLevel(encLevel)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		encLevel, sealFunc = p.cryptoSetup.GetSealer()
-	}
-
 	currentPacketNumber := p.packetNumberGenerator.Peek()
 	packetNumberLen := protocol.GetPacketNumberLengthForPublicHeader(currentPacketNumber, leastUnacked)
 	responsePublicHeader := &PublicHeader{
@@ -100,20 +86,6 @@ func (p *packetPacker) packPacket(stopWaitingFrame *frames.StopWaitingFrame, lea
 		PacketNumber:         currentPacketNumber,
 		PacketNumberLen:      packetNumberLen,
 		TruncateConnectionID: p.connectionParameters.TruncateConnectionID(),
-	}
-
-	if p.perspective == protocol.PerspectiveServer && encLevel == protocol.EncryptionSecure {
-		responsePublicHeader.DiversificationNonce = p.cryptoSetup.DiversificationNonce()
-	}
-
-	if p.perspective == protocol.PerspectiveClient && encLevel != protocol.EncryptionForwardSecure {
-		responsePublicHeader.VersionFlag = true
-		responsePublicHeader.VersionNumber = p.version
-	}
-
-	publicHeaderLength, err := responsePublicHeader.GetLength(p.perspective)
-	if err != nil {
-		return nil, err
 	}
 
 	if stopWaitingFrame != nil {
@@ -143,14 +115,45 @@ func (p *packetPacker) packPacket(stopWaitingFrame *frames.StopWaitingFrame, lea
 	} else if isConnectionClose {
 		payloadFrames = []frames.Frame{p.controlFrames[0]}
 	} else {
-		maxSize := protocol.MaxFrameAndPublicHeaderSize - publicHeaderLength
-		if !p.isForwardSecure {
+		maxSize := protocol.MaxFrameAndPublicHeaderSize
+		if p.isForwardSecure {
+			publicHeaderLength, err := responsePublicHeader.GetLength(p.perspective)
+			if err != nil {
+				return nil, err
+			}
+			maxSize -= publicHeaderLength
+		} else {
 			maxSize -= protocol.NonForwardSecurePacketSizeReduction
+			maxSize -= protocol.MaxPublicHeaderSize
 		}
+		var err error
 		payloadFrames, err = p.composeNextPacket(stopWaitingFrame, maxSize)
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	var sealFunc handshake.Sealer
+	var encLevel protocol.EncryptionLevel
+
+	var err error
+	if isHandshakeRetransmission {
+		encLevel = handshakePacketToRetransmit.EncryptionLevel
+		sealFunc, err = p.cryptoSetup.GetSealerWithEncryptionLevel(encLevel)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		encLevel, sealFunc = p.cryptoSetup.GetSealer()
+	}
+
+	if p.perspective == protocol.PerspectiveServer && encLevel == protocol.EncryptionSecure {
+		responsePublicHeader.DiversificationNonce = p.cryptoSetup.DiversificationNonce()
+	}
+
+	if p.perspective == protocol.PerspectiveClient && encLevel != protocol.EncryptionForwardSecure {
+		responsePublicHeader.VersionFlag = true
+		responsePublicHeader.VersionNumber = p.version
 	}
 
 	// Check if we have enough frames to send
@@ -196,7 +199,7 @@ func (p *packetPacker) packPacket(stopWaitingFrame *frames.StopWaitingFrame, lea
 
 	num := p.packetNumberGenerator.Pop()
 	if num != currentPacketNumber {
-		return nil, errors.New("PacketPacker BUG: Peeked and Popped packet numbers do not match.")
+		return nil, errors.New("PacketPacker BUG: Peeked and Popped packet numbers do not match")
 	}
 
 	return &packedPacket{
