@@ -320,6 +320,8 @@ func (s *stream) signalWrite() {
 	}
 }
 
+// SetDeadline sets the read deadline
+// it never errors
 func (s *stream) SetReadDeadline(t time.Time) error {
 	s.mutex.Lock()
 	oldDeadline := s.readDeadline
@@ -332,6 +334,8 @@ func (s *stream) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
+// SetWriteDeadline sets the write deadline
+// it never errors
 func (s *stream) SetWriteDeadline(t time.Time) error {
 	s.mutex.Lock()
 	oldDeadline := s.writeDeadline
@@ -340,6 +344,14 @@ func (s *stream) SetWriteDeadline(t time.Time) error {
 	if t.Before(oldDeadline) {
 		s.signalWrite()
 	}
+	return nil
+}
+
+// SetDeadlines sets a read and a write deadline
+// it never errors
+func (s *stream) SetDeadline(t time.Time) error {
+	_ = s.SetReadDeadline(t)  // SetReadDeadline never errors
+	_ = s.SetWriteDeadline(t) // SetWriteDeadline never errors
 	return nil
 }
 
