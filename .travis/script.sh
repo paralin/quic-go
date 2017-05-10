@@ -8,6 +8,9 @@ if [ ${TESTMODE} == "unit" ]; then
 fi
 
 if [ ${TESTMODE} == "integration" ]; then
+  # run benchmark tests
   ginkgo --randomizeAllSpecs --randomizeSuites --trace --progress -focus "Benchmark"
+  ginkgo --race --randomizeAllSpecs --randomizeSuites --trace --progress -focus "Benchmark"
+  # run integration tests
   ginkgo -r --randomizeAllSpecs --randomizeSuites --trace --progress integrationtests
 fi
